@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-// imap.js — read and manage email via IMAP
+// imap.js — read and manage email via IMAP (uses imapflow)
 
-const imapSimple = require('imap-simple');
+const { ImapFlow } = require('imapflow');
 const { simpleParser } = require('mailparser');
 const { loadConfig } = require('./config');
 
@@ -30,19 +30,15 @@ function parseRecent(str) {
   return null;
 }
 
-async function connect(cfg) {
-  const config = {
-    imap: {
-      host: cfg.IMAP_HOST,
-      port: parseInt(cfg.IMAP_PORT || '993'),
-      tls: cfg.IMAP_TLS !== 'false',
-      tlsOptions: { rejectUnauthorized: cfg.IMAP_REJECT_UNAUTHORIZED !== 'false' },
-      user: cfg.IMAP_USER,
-      password: cfg.IMAP_PASS,
-      authTimeout: 10000,
-    },
-  };
-  return imapSimple.connect(config);
+function getClient(cfg) {
+  return new ImapFlow({
+    host: cfg.IMAP_HOST,
+    port: parseInt(cfg.IMAP_PORT || '993'),
+    secure: cfg.IMAP_TLS !== 'false',
+    auth: { user: cfg.IMAP_USER, pass: cfg.IMAP_PASS },
+    tls: { rejectUnauthorized: cfg.IMAP_REJECT_UNAUTHORIZED !== 'false' },
+    logger: false,
+  });
 }
 
 async function cmdCheck() {
@@ -51,31 +47,30 @@ async function cmdCheck() {
   const recent = parseRecent(getArg('--recent'));
   const mailbox = getArg('--mailbox', cfg.IMAP_MAILBOX || 'INBOX');
 
-  const conn = await connect(cfg);
-  await conn.openBox(mailbox);
+  const client = getClient(cfg);
+  await client.connect();
+  await client.mailboxOpen(mailbox);
 
-  const criteria = ['UNSEEN'];
-  if (recent) criteria.push(['SINCE', recent.toISOString().split('T')[0]]);
+  const searchOpts = { seen: false };
+  if (recent) searchOpts.since = recent;
 
-  const fetchOptions = { bodies: ['HEADER.FIELDS (FROM TO SUBJECT DATE)'], markSeen: false };
-  const messages = await conn.search(criteria, fetchOptions);
-  const limited = messages.slice(-limit);
+  const uids = await client.search(searchOpts);
+  const limited = uids.slice(-limit);
 
-  if (limited.length === 0) {
+  if (!limited.length) {
     console.log('No unread messages found.');
-  } else {
-    console.log(`${limited.length} unread message(s):\n`);
-    for (const msg of limited) {
-      const header = msg.parts[0].body;
-      console.log(`UID: ${msg.attributes.uid}`);
-      console.log(`From: ${header.from?.[0] || ''}`);
-      console.log(`Subject: ${header.subject?.[0] || '(no subject)'}`);
-      console.log(`Date: ${header.date?.[0] || ''}`);
-      console.log('---');
-    }
+    await client.logout(); return;
   }
 
-  conn.end();
+  console.log(`${limited.length} unread message(s):\n`);
+  for await (const msg of client.fetch(limited, { envelope: true })) {
+    console.log(`UID: ${msg.uid}`);
+    console.log(`From: ${msg.envelope.from?.[0]?.address || ''}`);
+    console.log(`Subject: ${msg.envelope.subject || '(no subject)'}`);
+    console.log(`Date: ${msg.envelope.date || ''}`);
+    console.log('---');
+  }
+  await client.logout();
 }
 
 async function cmdFetch() {
@@ -84,64 +79,57 @@ async function cmdFetch() {
 
   const cfg = loadConfig();
   const mailbox = getArg('--mailbox', cfg.IMAP_MAILBOX || 'INBOX');
-  const conn = await connect(cfg);
-  await conn.openBox(mailbox);
+  const client = getClient(cfg);
+  await client.connect();
+  await client.mailboxOpen(mailbox);
 
-  const messages = await conn.search([['UID', String(uid)]], { bodies: [''], markSeen: false });
-  if (!messages.length) { console.log('Message not found.'); conn.end(); return; }
+  let found = false;
+  for await (const msg of client.fetch([uid], { source: true })) {
+    found = true;
+    const parsed = await simpleParser(msg.source);
+    console.log(`From: ${parsed.from?.text || ''}`);
+    console.log(`To: ${parsed.to?.text || ''}`);
+    console.log(`Subject: ${parsed.subject || '(no subject)'}`);
+    console.log(`Date: ${parsed.date || ''}`);
+    console.log(`\n--- Body ---\n`);
+    console.log(parsed.text || parsed.html || '(empty body)');
+  }
 
-  const raw = messages[0].parts[0].body;
-  const parsed = await simpleParser(raw);
-
-  console.log(`From: ${parsed.from?.text || ''}`);
-  console.log(`To: ${parsed.to?.text || ''}`);
-  console.log(`Subject: ${parsed.subject || '(no subject)'}`);
-  console.log(`Date: ${parsed.date || ''}`);
-  console.log(`\n--- Body ---\n`);
-  console.log(parsed.text || parsed.html || '(empty body)');
-
-  conn.end();
+  if (!found) console.log('Message not found.');
+  await client.logout();
 }
 
 async function cmdSearch() {
   const cfg = loadConfig();
   const limit = parseInt(getArg('--limit', '20'));
   const mailbox = getArg('--mailbox', cfg.IMAP_MAILBOX || 'INBOX');
-  const conn = await connect(cfg);
-  await conn.openBox(mailbox);
+  const client = getClient(cfg);
+  await client.connect();
+  await client.mailboxOpen(mailbox);
 
-  const criteria = [];
-  if (hasFlag('--unseen')) criteria.push('UNSEEN');
-  if (hasFlag('--seen')) criteria.push('SEEN');
-  const from = getArg('--from');
-  if (from) criteria.push(['FROM', from]);
-  const subject = getArg('--subject');
-  if (subject) criteria.push(['SUBJECT', subject]);
-  const since = getArg('--since');
-  if (since) criteria.push(['SINCE', since]);
-  const before = getArg('--before');
-  if (before) criteria.push(['BEFORE', before]);
-  const recent = parseRecent(getArg('--recent'));
-  if (recent) criteria.push(['SINCE', recent.toISOString().split('T')[0]]);
-  if (!criteria.length) criteria.push('ALL');
+  const searchOpts = {};
+  if (hasFlag('--unseen')) searchOpts.seen = false;
+  if (hasFlag('--seen')) searchOpts.seen = true;
+  if (getArg('--from')) searchOpts.from = getArg('--from');
+  if (getArg('--subject')) searchOpts.subject = getArg('--subject');
+  if (getArg('--since')) searchOpts.since = new Date(getArg('--since'));
+  if (getArg('--before')) searchOpts.before = new Date(getArg('--before'));
+  if (parseRecent(getArg('--recent'))) searchOpts.since = parseRecent(getArg('--recent'));
 
-  const fetchOptions = { bodies: ['HEADER.FIELDS (FROM TO SUBJECT DATE)'], markSeen: false };
-  const messages = await conn.search(criteria, fetchOptions);
-  const limited = messages.slice(-limit);
+  const uids = await client.search(Object.keys(searchOpts).length ? searchOpts : { all: true });
+  const limited = uids.slice(-limit);
 
-  if (!limited.length) { console.log('No messages found.'); conn.end(); return; }
+  if (!limited.length) { console.log('No messages found.'); await client.logout(); return; }
 
   console.log(`${limited.length} message(s):\n`);
-  for (const msg of limited) {
-    const header = msg.parts[0].body;
-    console.log(`UID: ${msg.attributes.uid}`);
-    console.log(`From: ${header.from?.[0] || ''}`);
-    console.log(`Subject: ${header.subject?.[0] || '(no subject)'}`);
-    console.log(`Date: ${header.date?.[0] || ''}`);
+  for await (const msg of client.fetch(limited, { envelope: true })) {
+    console.log(`UID: ${msg.uid}`);
+    console.log(`From: ${msg.envelope.from?.[0]?.address || ''}`);
+    console.log(`Subject: ${msg.envelope.subject || '(no subject)'}`);
+    console.log(`Date: ${msg.envelope.date || ''}`);
     console.log('---');
   }
-
-  conn.end();
+  await client.logout();
 }
 
 async function cmdMark(seen) {
@@ -150,34 +138,27 @@ async function cmdMark(seen) {
 
   const cfg = loadConfig();
   const mailbox = getArg('--mailbox', cfg.IMAP_MAILBOX || 'INBOX');
-  const conn = await connect(cfg);
-  await conn.openBox(mailbox);
+  const client = getClient(cfg);
+  await client.connect();
+  await client.mailboxOpen(mailbox);
 
   if (seen) {
-    await conn.addFlags(uid, '\\Seen');
+    await client.messageFlagsAdd([uid], ['\\Seen']);
     console.log(`UID ${uid} marked as read.`);
   } else {
-    await conn.delFlags(uid, '\\Seen');
+    await client.messageFlagsRemove([uid], ['\\Seen']);
     console.log(`UID ${uid} marked as unread.`);
   }
-
-  conn.end();
+  await client.logout();
 }
 
 async function cmdListMailboxes() {
   const cfg = loadConfig();
-  const conn = await connect(cfg);
-  const boxes = await conn.getBoxes();
-
-  function printBoxes(obj, prefix = '') {
-    for (const [name, box] of Object.entries(obj)) {
-      console.log(`${prefix}${name}`);
-      if (box.children) printBoxes(box.children, `${prefix}  `);
-    }
-  }
-
-  printBoxes(boxes);
-  conn.end();
+  const client = getClient(cfg);
+  await client.connect();
+  const list = await client.list();
+  for (const box of list) console.log(box.path);
+  await client.logout();
 }
 
 (async () => {
